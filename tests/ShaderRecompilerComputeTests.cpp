@@ -1747,7 +1747,7 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test, u32 wave_size = 64) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1774,6 +1774,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
+  options.wave_size = wave_size;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -34843,6 +34844,78 @@ GraphicsCase GraphicsInterpolationExport() {
            O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
 }
 
+// Reconstructs the wave64 UMIN sequence captured from Construction Simulator's
+// character-creation fragment shader (0x2cc8442065bd20be, PC 0x1104..0x1144).
+GraphicsCase GraphicsWaveMinimum(u32 row_mask = 0xf, u32 last_lane = 63,
+                                 u32 last_shift = 0x118, bool masked_exec = false,
+                                 bool extra_read_use = false, bool expanded_exec = false) {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeVintrp(0x02, 12, 0, 1, 2));
+  if (masked_exec || expanded_exec) {
+    code.push_back(EncodeVopc(0xc2, InlineU32(0), 12));
+    code.push_back(EncodeSop1(0x04, 126, 106));
+  }
+  if (expanded_exec) {
+    code.push_back(EncodeSop1(0x04, 8, 126));
+    code.push_back(EncodeSop1(0x28, 106, 126)); // ORN2_SAVEEXEC EXEC,EXEC
+    AppendVop3(&code, 0x101, 12, 193u, Vgpr(12), 8); // inactive lanes contribute UINT_MAX
+  }
+  for (u32 shift : {0x111u, 0x112u, 0x114u, last_shift}) {
+    code.push_back(EncodeVop2(0x13, 12, 250, 12));
+    code.push_back(EncodeVop2Dpp(12, shift, row_mask));
+  }
+  AppendVop3(&code, 0x378, 11, Vgpr(12), 193u, 193u, 0, 2);
+  code.push_back(EncodeVop2(0x13, 12, Vgpr(12), 11));
+  if (expanded_exec) {
+    code.push_back(EncodeSop1(0x04, 126, 106));
+  }
+  AppendVop3(&code, 0x360, 4, Vgpr(12), InlineU32(31));
+  AppendVop3(&code, 0x360, 5, Vgpr(12), InlineU32(last_lane));
+  code.push_back(EncodeSop2(0x07, 2, 4, 5));
+  code.push_back(EncodeVop1(0x01, 0, 2));
+  if (extra_read_use) {
+    code.push_back(EncodeVop1(0x01, 1, 5));
+  }
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(0, extra_read_use ? 1 : 0, 0, 0));
+  AppendEnd(&code);
+  return {"GraphicsWaveMinimum", code,
+          {0x3f000000u, 0x3f000000u, 0x3f000000u, 0x3f000000u},
+          {O::V_INTERP_MOV_F32, O::V_MIN_U32, O::V_PERMLANEX16_B32,
+           O::V_READLANE_B32, O::S_MIN_U32, O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
+}
+
+void CheckGraphicsWaveMinimum() {
+  const auto check = [](const GraphicsCase& test, bool reduction, u32 wave_size = 64) {
+    const auto shader = CompileFragmentCase(test, wave_size);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(test.name, "wave minimum disassembly", tools.Disassemble(shader.spirv, &text),
+            "could not disassemble fragment shader");
+    Require(test.name, "wave minimum recognition",
+            CountText(text, "OpGroupNonUniformUMin ") == (reduction ? 1u : 0u),
+            "only a complete wave minimum may become a subgroup reduction");
+    if (reduction) {
+      Require(test.name, "wave minimum capability",
+              text.find("OpCapability GroupNonUniformArithmetic") != std::string::npos,
+              "missing subgroup arithmetic capability");
+      Require(test.name, "wave minimum lane bounds",
+              text.find("%uint_63") == std::string::npos,
+              "the reduction still addresses nonexistent lane 63");
+    }
+  };
+  check(GraphicsWaveMinimum(), true);
+  check(GraphicsWaveMinimum(), false, 32);
+  check(GraphicsWaveMinimum(0xf, 63, 0x118, false, false, true), true);
+  check(GraphicsWaveMinimum(0x7), false);
+  check(GraphicsWaveMinimum(0xf, 47), false);
+  check(GraphicsWaveMinimum(0xf, 63, 0x117), false);
+  check(GraphicsWaveMinimum(0xf, 63, 0x118, true), false);
+  check(GraphicsWaveMinimum(0xf, 63, 0x118, false, true), false);
+  CheckWave64WholeWaveResults();
+}
+
 GraphicsCase GraphicsPositionWExport() {
   GraphicsCase test;
   test.name = "GraphicsPositionWExport";
@@ -35753,6 +35826,7 @@ std::vector<TestCase> MakeCases() {
 std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
       GraphicsInterpolationExport(),
+      GraphicsWaveMinimum(),
       GraphicsPositionWExport(),
       GraphicsPackedHalfCentroid(),
       GraphicsPackedHalfInputAlias(false),
@@ -40718,6 +40792,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--graphics-wave-min-only") == 0) {
+    CheckGraphicsWaveMinimum();
+    std::puts("[host]    GraphicsWaveMinimum            ok");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {

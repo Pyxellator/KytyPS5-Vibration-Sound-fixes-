@@ -610,6 +610,10 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_graphics_wave_min
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --graphics-wave-min-only)
+	set_tests_properties(shader_graphics_wave_min PROPERTIES
+	                     PASS_REGULAR_EXPRESSION "GraphicsWaveMinimum[ ]+ok")
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)

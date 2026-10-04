@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -63,6 +64,7 @@ struct SpirvRequirements {
 	bool subgroup_ballot              = false;
 	bool subgroup_barrier             = false;
 	bool subgroup_shuffle             = false;
+	bool subgroup_arithmetic          = false;
 	bool subgroup_local_invocation_id = false;
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
@@ -76,6 +78,14 @@ struct SpirvRequirements {
 	bool coherent_buffers             = false;
 	bool float64                      = false;
 };
+
+struct WaveMinReduction {
+	IR::Value input;
+	const IR::Inst* low = nullptr;
+	const IR::Inst* high = nullptr;
+};
+
+WaveMinReduction MatchWaveMinReduction(const IR::Program& program, const IR::Inst& inst);
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 
@@ -92,6 +102,8 @@ struct EmitterState {
 		}
 	}
 
+	std::unordered_map<const IR::Inst*, IR::Value> wave_min_inputs;
+	std::unordered_set<const IR::Inst*> wave_min_reads;
 	Builder                                          builder;
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;

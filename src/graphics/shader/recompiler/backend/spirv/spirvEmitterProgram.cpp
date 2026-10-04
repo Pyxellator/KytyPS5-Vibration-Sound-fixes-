@@ -243,6 +243,18 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.state.wave_min_reads.contains(&inst)) {
+		return;
+	}
+	if (const auto found = ctx.state.wave_min_inputs.find(&inst);
+	    found != ctx.state.wave_min_inputs.end()) {
+		const auto result = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(ctx.state), result,
+		                              ConstantU32(ctx.state, spv::ScopeSubgroup),
+		                              spv::GroupOperationReduce, ctx.Def(found->second));
+		ctx.Define(inst, result);
+		return;
+	}
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
 	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
 		// Both operations already combine both emulated halves into one whole-wave result.
@@ -612,8 +624,122 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 	std::abort();
 }
 
+WaveMinReduction MatchWaveMinReduction(const IR::Program& program, const IR::Inst& inst) {
+	using O = IR::ValueOpcode;
+	if (program.stage != ShaderType::Pixel || program.wave_size != 64 ||
+	    program.dispatcher_fallback || inst.GetOpcode() != O::UMin32) {
+		return {};
+	}
+	const auto op = [](IR::Value value, O opcode) -> const IR::Inst* {
+		const auto* node = value.Resolve().TryInstruction();
+		return node != nullptr && node->GetOpcode() == opcode ? node : nullptr;
+	};
+	const auto imm = [](IR::Value value, uint32_t expected) {
+		value = value.Resolve();
+		return value.IsImmediate() && value.GetType() == IR::Type::U32 && value.U32() == expected;
+	};
+	const auto same = [](IR::Value a, IR::Value b) { return a.Resolve() == b.Resolve(); };
+	const auto* low = op(inst.Arg(0), O::ReadLane);
+	const auto* high = op(inst.Arg(1), O::ReadLane);
+	if (low != nullptr && high != nullptr && imm(low->Arg(1), 63)) {
+		std::swap(low, high);
+	}
+	if (low == nullptr || high == nullptr || !imm(low->Arg(1), 31) || !imm(high->Arg(1), 63) ||
+	    low->UseCount() != 1 || high->UseCount() != 1 || low->Parent() != inst.Parent() ||
+	    high->Parent() != inst.Parent() || !same(low->Arg(0), high->Arg(0))) {
+		return {};
+	}
+	// Only a complete, unmasked row-prefix minimum followed by the x16 exchange
+	// is a wave reduction. Arbitrary READLANE operations must retain their lane index.
+	const auto full_exec = [&](IR::Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			return value.GetType() == IR::Type::U1 && value.U1();
+		}
+		const auto* either = op(value, O::LogicalOr);
+		if (either == nullptr) {
+			return false;
+		}
+		for (uint32_t i = 0; i < 2; ++i) {
+			const auto* inverse = op(either->Arg(i), O::LogicalNot);
+			if (inverse != nullptr && same(inverse->Arg(0), either->Arg(1 - i))) {
+				return true;
+			}
+		}
+		return false;
+	};
+	const auto unguard = [&](IR::Value value) {
+		const auto* select = op(value, O::SelectU32);
+		return select != nullptr && full_exec(select->Arg(0)) ? select->Arg(1).Resolve()
+		                                                    : value.Resolve();
+	};
+	const auto* combined = op(unguard(low->Arg(0)), O::UMin32);
+	if (combined == nullptr) {
+		return {};
+	}
+	const IR::Inst* exchange = nullptr;
+	IR::Value       row;
+	for (uint32_t i = 0; i < 2; ++i) {
+		const auto* candidate = op(unguard(combined->Arg(i)), O::Permlane16U32);
+		if (candidate != nullptr && same(candidate->Arg(0), combined->Arg(1 - i))) {
+			exchange = candidate;
+			row = candidate->Arg(0);
+			break;
+		}
+	}
+	if (exchange == nullptr) {
+		return {};
+	}
+	const auto perm = exchange->Flags<IR::PermlaneFlags>();
+	// With full EXEC all selected guest lanes exist, so PERMLANE bound_control has no effect.
+	if (!perm.x16 || perm.fetch_inactive || !imm(exchange->Arg(1), UINT32_MAX) ||
+	    !imm(exchange->Arg(2), UINT32_MAX) || !full_exec(exchange->Arg(3))) {
+		return {};
+	}
+	const auto valid_dpp = [](const IR::Inst& node, uint32_t control) {
+		const auto flags = node.Flags<IR::DppMoveFlags>();
+		return flags.control == control && flags.row_mask == 0xf && flags.bank_mask == 0xf &&
+		       !flags.fetch_inactive && !flags.bound_control && !flags.dpp8;
+	};
+	for (const auto control: {0x118u, 0x114u, 0x112u, 0x111u}) {
+		const auto* update = op(row, O::DppUpdateU32);
+		if (update == nullptr || !valid_dpp(*update, control) || !full_exec(update->Arg(2))) {
+			return {};
+		}
+		const auto previous = update->Arg(1);
+		const auto* minimum = op(update->Arg(0), O::UMin32);
+		if (minimum == nullptr) {
+			return {};
+		}
+		bool matched = false;
+		for (uint32_t i = 0; i < 2; ++i) {
+			const auto* move = op(minimum->Arg(i), O::DppMoveU32);
+			matched |= move != nullptr && valid_dpp(*move, control) &&
+			           same(move->Arg(0), previous) && full_exec(move->Arg(1)) &&
+			           same(minimum->Arg(1 - i), previous);
+		}
+		if (!matched) {
+			return {};
+		}
+		row = previous;
+	}
+	// Native fragment subgroups may be narrower than the guest wave64. Reducing
+	// the original (neutral-filled) values avoids undefined shuffles from lane 63.
+	return {row.Resolve(), low, high};
+}
+
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto reduction = MatchWaveMinReduction(program, inst);
+			if (!reduction.input.IsEmpty()) {
+				state.wave_min_inputs.emplace(&inst, reduction.input);
+				state.wave_min_reads.insert(reduction.low);
+				state.wave_min_reads.insert(reduction.high);
+			}
+		}
+	}
 	ValueEmitContext ctx(state);
 	ValueEmitContext high(state);
 	if (state.lane_count == 2) {
