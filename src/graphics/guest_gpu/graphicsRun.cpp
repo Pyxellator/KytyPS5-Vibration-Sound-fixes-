@@ -1086,9 +1086,21 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
+					const auto* gds = m_renderer.GetBufferCache().GetGdsBuffer();
+					command.EndRendering();
+					vk::BufferMemoryBarrier barrier {};
+					barrier.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+					barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+					barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+					barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+					barrier.buffer              = gds->Handle();
+					barrier.offset              = 0;
+					barrier.size                = gds->Size();
+					command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+					                                 vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+					                                 1, &barrier, 0, nullptr);
 					SynchronizeGpu();
-					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
-					              value >> 16u);
+					Sync::ReadGds(*gds, dst, value & 0xffffu, value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
 					                            value >> 16u);
 					if (with_interrupt) {

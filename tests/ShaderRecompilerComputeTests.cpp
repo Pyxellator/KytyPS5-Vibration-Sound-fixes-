@@ -2915,6 +2915,8 @@ public:
       bool release_mem_submission_counts = false;
       gpu.SendCommandSync([&] {
         processor->BufferInit();
+        context.GetBufferCache().FillBuffer(4 * sizeof(uint32_t), sizeof(uint32_t),
+                                            0x12345678u, true);
 
         const auto clock_before = Sync::ReadReferenceClock();
         processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
@@ -2939,7 +2941,7 @@ public:
                   "label-only release submitted work or interrupt release lost its boundary");
         }
 
-        auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
+        auto gds = make_release_mem(5, 0, &gds_label, (1ull << 16u) | 4u);
         Pm4Execution gds_execution;
         const auto gds_tick = gpu_scheduler.CurrentTick();
         const auto gds_result = processor->Process(gds_execution, gds);
@@ -2954,7 +2956,7 @@ public:
         const bool interrupt_split_once =
             gpu_scheduler.CurrentTick() == interrupt_tick + 1;
 
-        auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
+        auto gds_interrupt = make_release_mem(5, 2, &gds_label, (1ull << 16u) | 4u);
         Pm4Execution gds_interrupt_execution;
         const auto gds_interrupt_tick = gpu_scheduler.CurrentTick();
         const auto gds_interrupt_result =
@@ -2976,7 +2978,7 @@ public:
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
-                  static_cast<uint32_t>(gds_label) == 0,
+                  static_cast<uint32_t>(gds_label) == 0x12345678u,
               "RELEASE_MEM lost its required split/readback or retained a "
               "redundant GPU wait");
     }

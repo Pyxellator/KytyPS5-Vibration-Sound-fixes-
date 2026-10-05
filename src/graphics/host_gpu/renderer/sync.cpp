@@ -293,6 +293,7 @@ void ReadGds(const Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_s
 	const auto size   = uint64_t {dw_size} * sizeof(uint32_t);
 	EXIT_IF(dst == nullptr || offset > gds.Size() || size > gds.Size() - offset ||
 	        gds.Mapped().empty());
+	gds.Invalidate(offset, size);
 	std::memcpy(dst, gds.Mapped().data() + offset, static_cast<size_t>(size));
 }
 

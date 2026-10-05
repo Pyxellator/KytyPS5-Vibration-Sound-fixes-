@@ -128,8 +128,9 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 	}
 }
 
-void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+void Buffer::Invalidate(uint64_t offset, uint64_t size) const {
+	EXIT_IF((m_usage != MemoryUsage::Download && m_usage != MemoryUsage::Stream) ||
+	        m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
