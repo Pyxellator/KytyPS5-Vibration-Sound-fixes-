@@ -723,6 +723,23 @@ WaveMinReduction MatchWaveMinReduction(const IR::Program& program, const IR::Ins
 		}
 		row = previous;
 	}
+	// A temporary full EXEC also computes lanes that were inactive before the
+	// scan. Only fold it when those lanes were filled with UMIN's neutral value.
+	// READLANE ignores EXEC, whereas a native subgroup reduction does not.
+	if (const auto* all_lanes = op(exchange->Arg(3), O::LogicalOr)) {
+		const auto* inverse = op(all_lanes->Arg(0), O::LogicalNot);
+		const auto original_exec = inverse != nullptr && same(inverse->Arg(0), all_lanes->Arg(1))
+		                               ? all_lanes->Arg(1)
+		                               : all_lanes->Arg(0);
+		const auto* full_write = op(row, O::SelectU32);
+		const auto* neutralized =
+		    full_write != nullptr ? op(full_write->Arg(1), O::SelectU32) : nullptr;
+		if (full_write == nullptr || !same(full_write->Arg(0), exchange->Arg(3)) ||
+		    neutralized == nullptr || !same(neutralized->Arg(0), original_exec) ||
+		    !imm(neutralized->Arg(2), UINT32_MAX)) {
+			return {};
+		}
+	}
 	// Native fragment subgroups may be narrower than the guest wave64. Reducing
 	// the original (neutral-filled) values avoids undefined shuffles from lane 63.
 	return {row.Resolve(), low, high};

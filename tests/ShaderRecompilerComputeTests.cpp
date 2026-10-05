@@ -34848,7 +34848,8 @@ GraphicsCase GraphicsInterpolationExport() {
 // character-creation fragment shader (0x2cc8442065bd20be, PC 0x1104..0x1144).
 GraphicsCase GraphicsWaveMinimum(u32 row_mask = 0xf, u32 last_lane = 63,
                                  u32 last_shift = 0x118, bool masked_exec = false,
-                                 bool extra_read_use = false, bool expanded_exec = false) {
+                                 bool extra_read_use = false, bool expanded_exec = false,
+                                 bool neutralize_inactive = true) {
   using O = ShaderOpcode;
   std::vector<u32> code;
   code.push_back(EncodeVintrp(0x02, 12, 0, 1, 2));
@@ -34859,7 +34860,9 @@ GraphicsCase GraphicsWaveMinimum(u32 row_mask = 0xf, u32 last_lane = 63,
   if (expanded_exec) {
     code.push_back(EncodeSop1(0x04, 8, 126));
     code.push_back(EncodeSop1(0x28, 106, 126)); // ORN2_SAVEEXEC EXEC,EXEC
-    AppendVop3(&code, 0x101, 12, 193u, Vgpr(12), 8); // inactive lanes contribute UINT_MAX
+    if (neutralize_inactive) {
+      AppendVop3(&code, 0x101, 12, 193u, Vgpr(12), 8);
+    }
   }
   for (u32 shift : {0x111u, 0x112u, 0x114u, last_shift}) {
     code.push_back(EncodeVop2(0x13, 12, 250, 12));
@@ -34908,6 +34911,7 @@ void CheckGraphicsWaveMinimum() {
   check(GraphicsWaveMinimum(), true);
   check(GraphicsWaveMinimum(), false, 32);
   check(GraphicsWaveMinimum(0xf, 63, 0x118, false, false, true), true);
+  check(GraphicsWaveMinimum(0xf, 63, 0x118, false, false, true, false), false);
   check(GraphicsWaveMinimum(0x7), false);
   check(GraphicsWaveMinimum(0xf, 47), false);
   check(GraphicsWaveMinimum(0xf, 63, 0x117), false);
