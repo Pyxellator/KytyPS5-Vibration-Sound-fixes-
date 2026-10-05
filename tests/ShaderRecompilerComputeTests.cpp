@@ -39401,9 +39401,10 @@ void CheckVulkan13FeatureRequirements() {
   std::printf("[host]    %-32s ok\n", "Vulkan13FeatureRequirements");
 }
 
-void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
+void CheckPm4AcquireMemPackets(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
+  processor.BufferInit();
   const std::array<uint32_t, 6> standard_payload{0x00400000u, 1u, 0u,
                                                  0u,          0u, 10u};
   const std::array<uint32_t, 7> custom_payload{
@@ -39411,17 +39412,16 @@ void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
       0x2468ace0u, 0xaaaaaaaau, 0x55555555u};
   const auto standard_before = standard_payload;
   const auto custom_before = custom_payload;
-  Require("Pm4AcquireMemNoOp", "recognized packets",
+  Require("Pm4AcquireMemPackets", "recognized packets",
           CpOpAcquireMem(processor, 0xC0055800u, standard_payload.data(), 0,
                          0) == 6 &&
               CpOpAcquireMem(processor, 0xc0061050u, custom_payload.data(), 0,
                              0) == 7 &&
               standard_payload == standard_before &&
               custom_payload == custom_before,
-          "ACQUIRE_MEM did not consume both pinned packet forms as "
-          "side-effect-free "
-          "no-ops");
-  std::printf("[host]    %-32s ok\n", "Pm4AcquireMemNoOp");
+          "ACQUIRE_MEM did not record both packet forms without changing their data");
+  processor.BufferWait();
+  std::printf("[host]    %-32s ok\n", "Pm4AcquireMemPackets");
 }
 
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
@@ -41667,7 +41667,7 @@ int main(int argc, char **argv) {
   CheckErrorDialogLifecycle();
   CheckSigninDialogLifecycle();
   CheckVulkan13FeatureRequirements();
-  CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
+  CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());

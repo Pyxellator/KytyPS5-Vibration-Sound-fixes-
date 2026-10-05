@@ -1305,6 +1305,10 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	// ACQUIRE_MEM makes preceding GPU writes visible to later commands. The
+	// packet's guest cache flags and address range have no direct Vulkan equivalent.
+	// A global dependency preserves the ordering for both supported packet forms.
+	cp.EmitGlobalBarrier();
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
