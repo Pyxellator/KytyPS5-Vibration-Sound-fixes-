@@ -540,6 +540,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	if (result != vk::Result::eSuccess) {
+		LOGF("vkCreateGraphicsPipelines failed: result=%s VS=%" PRIu64 " PS=%" PRIu64
+		     " stages=%" PRIu32 " color_attachments=%" PRIu32 "\n",
+		     vk::to_string(result).c_str(), vertex_program.id,
+		     ps_active ? pixel_program.id : 0, shader_stage_count, rendering.color_count);
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
