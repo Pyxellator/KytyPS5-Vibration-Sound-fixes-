@@ -1234,12 +1234,18 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 	}
 
 	program = rt->LoadProgram(module_path);
+	auto dependencies = rt->LoadDependencies(program);
 
 	auto handle = program->unique_id;
 
 	program->dbg_print_reloc = true;
 
 	rt->RelocateProgram(program);
+	for (auto* dependency: dependencies) {
+		if (dependency->dynamic_info->init_vaddr != 0) {
+			rt->StartModule(dependency, 0, nullptr, nullptr);
+		}
+	}
 
 	program->load_count = 1;
 	int result = rt->StartModule(program, args, argp, nullptr);

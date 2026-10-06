@@ -101,6 +101,7 @@ struct DynamicInfo {
 	uint64_t flags   = 0;
 
 	const char* so_name = nullptr;
+	std::vector<std::string> needed;
 
 	std::vector<ModuleId>  export_modules;
 	std::vector<ModuleId>  import_modules;
@@ -114,7 +115,7 @@ struct Program {
 
 	int32_t                      unique_id = -1;
 	RuntimeLinker*               rt        = nullptr;
-	uint32_t                     load_count = 0; // Successful sceKernelLoadStartModule calls.
+	uint32_t                     load_count = 0; // Explicit loads and implicit dependency references.
 	std::filesystem::path        file_name;
 	std::unique_ptr<Elf64>       elf;
 	std::unique_ptr<DynamicInfo> dynamic_info;
@@ -143,6 +144,7 @@ public:
 	void DbgDump(const std::string& folder);
 
 	Program* LoadProgram(const std::filesystem::path& elf_name);
+	std::vector<Program*> LoadDependencies(Program* program);
 	void     SaveMainProgram(const std::filesystem::path& elf_name);
 	void     SaveProgram(Program* program, const std::filesystem::path& elf_name);
 	void     UnloadProgram(Program* program);

@@ -25,10 +25,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <functional>
 #include <magic_enum.hpp>
 #include <memory>
 #include <vector>
@@ -1217,6 +1219,76 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	return program;
 }
 
+std::vector<Program*> RuntimeLinker::LoadDependencies(Program* program) {
+	Common::LockGuard lock(m_mutex);
+
+	std::vector<Program*> loaded;
+	if (program == nullptr || m_programs.empty()) {
+		return loaded;
+	}
+
+	const auto app_root = m_programs.front()->file_name.parent_path();
+	std::vector<Program*> visited;
+
+	std::function<void(Program*)> visit = [&](Program* importer) {
+		if (std::find(visited.begin(), visited.end(), importer) != visited.end()) {
+			return;
+		}
+		visited.push_back(importer);
+
+		auto load = [&](const std::string& name) {
+			if (name.empty() ||
+			    !std::all_of(name.begin(), name.end(), [](unsigned char c) {
+				    return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
+			    })) {
+				return;
+			}
+			const auto lower = Common::ToLower(name);
+			if ((!lower.ends_with(".prx") && !lower.ends_with(".sprx")) ||
+			    lower == "libkernel.prx" || lower == "libkernel_sys.prx") {
+				return;
+			}
+
+			for (const auto& dir: {app_root, app_root / "sce_module", app_root / "sce_modules",
+			                      importer->file_name.parent_path()}) {
+				const auto path = dir / name;
+				if (!Common::File::IsFileExisting(path)) {
+					continue;
+				}
+				auto* dependency = FindProgramByFileName(path);
+				const bool is_new = dependency == nullptr;
+				if (is_new) {
+					dependency = LoadProgram(path);
+					dependency->fail_if_global_not_resolved = false;
+					dependency->load_count = 1; // Keep an implicit reference while importers use it.
+				}
+				visit(dependency);
+				if (is_new) {
+					loaded.push_back(dependency);
+				}
+				break;
+			}
+		};
+
+		for (const auto& name: importer->dynamic_info->needed) {
+			load(name);
+		}
+		// An import module can name a bundled PRX even without a DT_NEEDED entry.
+		for (const auto& module: importer->dynamic_info->import_modules) {
+			if (module.name == "libc") {
+				load("libc.prx");
+			} else if (module.name.starts_with("libSce")) {
+				load(module.name + ".prx");
+			} else {
+				load("libSce" + module.name + ".prx");
+			}
+		}
+	};
+
+	visit(program);
+	return loaded;
+}
+
 void RuntimeLinker::SaveMainProgram(const std::filesystem::path& elf_name) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
@@ -1265,9 +1337,11 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 #endif
 
-	// The runtime automatically loads libc; other PRXs are requested by the application.
+	// Load packaged PRXs declared by the main program before resolving imports.
 	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
 	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
+	const auto libc_dependencies = LoadDependencies(libc);
+	const auto main_dependencies = LoadDependencies(m_programs.empty() ? nullptr : m_programs.front());
 	RelocateAll();
 
 	if (!game_patch.empty()) {
@@ -1276,8 +1350,18 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	for (auto* dependency: libc_dependencies) {
+		if (dependency->dynamic_info->init_vaddr != 0) {
+			StartModule(dependency, 0, nullptr, nullptr);
+		}
+	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
+	}
+	for (auto* dependency: main_dependencies) {
+		if (dependency->dynamic_info->init_vaddr != 0) {
+			StartModule(dependency, 0, nullptr, nullptr);
+		}
 	}
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -1956,6 +2040,11 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	uint64_t so_name = 0;
 	GetDynValue(elf, &so_name, DT_SONAME);
 	program->dynamic_info->so_name = program->dynamic_info->str_table + so_name;
+	std::vector<uint64_t> needed;
+	GetDynValues(elf, &needed, DT_NEEDED);
+	for (auto offset: needed) {
+		program->dynamic_info->needed.emplace_back(program->dynamic_info->str_table + offset);
+	}
 
 	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_NEEDED_MODULE) &&
 	                     elf->HasDynValue(DT_OS_NEEDED_MODULE_1));
