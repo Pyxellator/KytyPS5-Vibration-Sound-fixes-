@@ -503,6 +503,10 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
+	// Null descriptors may be sampled before any guest write. Vulkan leaves the
+	// contents of a newly created image undefined, while the guest expects zero.
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	ClearImage(m_scheduler.Current(), id, info.pixel_format, range, {});
 	m_null_images.emplace(format, id);
 	return id;
 }

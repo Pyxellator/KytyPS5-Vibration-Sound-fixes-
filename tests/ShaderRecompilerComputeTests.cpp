@@ -5421,6 +5421,10 @@ public:
       Require(name, "null image",
               null_image && null_repeat == null_image && null_image != exact,
               "typed null-image lookup was not stable");
+      Require(name, "null image contents",
+              ReadCachedTexel(name, context, null_image) ==
+                  std::vector<u32>{0},
+              "new null-image backing exposed undefined Vulkan contents");
 
       constexpr uint64_t extent_alias_offset = 0x2400000;
       auto narrow_target = sampled;
