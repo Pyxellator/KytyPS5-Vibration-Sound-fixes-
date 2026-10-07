@@ -2107,8 +2107,10 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 
 	return 0;
 #else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
+	if (::shutdown(socket, how) != 0) {
+		return SetHostSocketError();
+	}
+	return 0;
 #endif
 }
 

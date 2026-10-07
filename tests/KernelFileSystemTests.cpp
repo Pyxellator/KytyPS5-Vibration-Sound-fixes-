@@ -1092,6 +1092,9 @@ void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
   Libs::LibNet::InitNet_1_Net(&symbols);
+  Libs::InitLibKernel_1(&symbols);
+  const auto *posix_shutdown_symbol = symbols.Find(
+      {"TUuiYS2kE8s", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
   const auto *connect_symbol = symbols.Find(
       {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *getsockopt_symbol = symbols.Find(
@@ -1108,9 +1111,10 @@ void CheckSocketWakeup() {
       {"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
       {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  Check(connect_symbol && getsockopt_symbol && setsockopt_symbol && send_symbol && sendto_symbol &&
-            recv_symbol && recvfrom_symbol && errno_symbol,
+  Check(posix_shutdown_symbol && connect_symbol && getsockopt_symbol && setsockopt_symbol &&
+            send_symbol && sendto_symbol && recv_symbol && recvfrom_symbol && errno_symbol,
         "Net socket and errno exports resolve with the guest ABI versions");
+  using Shutdown = int (KYTY_SYSV_ABI *)(int, int);
   using Connect = int (KYTY_SYSV_ABI *)(int, const void *, uint32_t);
   using Getsockopt = int (KYTY_SYSV_ABI *)(int, int, int, void *, uint32_t *);
   using Setsockopt = int (KYTY_SYSV_ABI *)(int, int, int, const void *, uint32_t);
@@ -1126,7 +1130,11 @@ void CheckSocketWakeup() {
   const auto net_sendto = reinterpret_cast<Sendto>(sendto_symbol->vaddr);
   const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
   const auto net_recvfrom = reinterpret_cast<Recvfrom>(recvfrom_symbol->vaddr);
+  const auto posix_shutdown = reinterpret_cast<Shutdown>(posix_shutdown_symbol->vaddr);
   auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
+  Check(posix_shutdown(-1, 2) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "POSIX shutdown rejects an invalid socket with guest errno");
   const auto [reader, writer] = CreateTcpPair();
   const int enabled = 1;
   Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
@@ -1332,6 +1340,10 @@ void CheckSocketWakeup() {
   CheckSocketReceiveBuffer(reader, writer);
   CheckSocketReceiveConcurrency();
 #endif
+  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+  Check(posix_shutdown(writer, 1) == 0 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "POSIX shutdown closes the send direction without changing errno");
   Check(Net::SocketClose(writer) == 0, "close wake writer");
   *net_errno = Libs::Posix::POSIX_EINVAL;
   Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
@@ -1348,7 +1360,7 @@ void CheckSocketWakeup() {
 
 } // namespace
 
-int main(int, char**) {
+int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -1356,6 +1368,13 @@ int main(int, char**) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+
+  if (argc == 2 && std::strcmp(argv[1], "--socket-only") == 0) {
+    CheckSocketWakeup();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: socket cases passed\n");
+    return 0;
+  }
 
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
