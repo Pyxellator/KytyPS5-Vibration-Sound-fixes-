@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -24,6 +25,35 @@ struct ScissorRect {
 	int right  = 0;
 	int bottom = 0;
 };
+
+struct FrameTraceRecord {
+	enum class Kind: uint8_t { IndexedDraw, AutoDraw, DirectDispatch, IndirectDispatch };
+	Kind kind = Kind::IndexedDraw;
+	uint64_t submit_id = 0;
+	uint64_t vertex_hash = 0;
+	uint64_t pixel_hash = 0;
+	uint32_t work_count[3] = {};
+	uint32_t target_count = 0;
+	uint32_t texture_count = 0;
+	uint32_t buffer_count = 0;
+	std::array<uint64_t, 8> target_addresses {};
+	std::array<uint32_t, 8> target_formats {};
+	std::array<uint32_t, 8> target_slots {};
+	std::array<uint32_t, 8> target_widths {};
+	std::array<uint32_t, 8> target_heights {};
+	std::array<uint64_t, 16> texture_addresses {};
+	std::array<uint32_t, 16> texture_formats {};
+	std::array<uint32_t, 16> texture_widths {};
+	std::array<uint32_t, 16> texture_heights {};
+	std::array<uint32_t, 16> texture_depths {};
+	std::array<uint32_t, 16> texture_view_formats {};
+	std::array<uint32_t, 16> texture_view_types {};
+};
+
+void RequestFrameTrace();
+void FrameTraceOnGuestFlip();
+bool FrameTraceActive();
+void FrameTraceAdd(const FrameTraceRecord& record);
 
 uint32_t                 render_target_mask_slot(uint32_t mask, uint32_t slot);
 uint32_t                 render_target_first_bound_slot(const CommandBuffer& buffer);

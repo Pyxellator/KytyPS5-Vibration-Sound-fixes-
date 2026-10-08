@@ -1110,6 +1110,41 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	if (FrameTraceActive()) {
+		FrameTraceRecord trace {};
+		trace.kind = draw.IsIndexed() ? FrameTraceRecord::Kind::IndexedDraw
+		                              : FrameTraceRecord::Kind::AutoDraw;
+		trace.submit_id = submit_id;
+		trace.vertex_hash = state.vertex_info[0].stage.program != nullptr
+		                        ? state.vertex_info[0].stage.program->shader_hash : 0;
+		trace.pixel_hash = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                       ? state.ps_input_info.stage.program->shader_hash : 0;
+		trace.work_count[0] = draw.index_count;
+		trace.work_count[1] = draw.instance_count;
+		trace.target_count = state.color_count;
+		for (uint32_t i = 0; i < std::min<size_t>(state.color_count, trace.target_addresses.size()); i++) {
+			trace.target_addresses[i] = state.color_info[i].desc.info.data.address;
+			trace.target_formats[i] = static_cast<uint32_t>(state.color_info[i].desc.info.guest_format);
+			trace.target_slots[i] = state.color_info[i].target_slot;
+			trace.target_widths[i] = state.color_info[i].Extent().width;
+			trace.target_heights[i] = state.color_info[i].Extent().height;
+		}
+		if (state.ps_active && bindings.pixel) {
+			trace.texture_count = static_cast<uint32_t>(bindings.pixel->images.size());
+			trace.buffer_count = static_cast<uint32_t>(bindings.pixel->buffers.size());
+			for (size_t i = 0; i < std::min(bindings.pixel->images.size(), trace.texture_addresses.size()); i++) {
+				trace.texture_addresses[i] = bindings.pixel->images[i].desc.info.data.address;
+				trace.texture_formats[i] = static_cast<uint32_t>(bindings.pixel->images[i].desc.info.guest_format);
+				const auto& texture = bindings.pixel->images[i].desc;
+				trace.texture_widths[i] = texture.info.extent.width;
+				trace.texture_heights[i] = texture.info.extent.height;
+				trace.texture_depths[i] = texture.info.extent.depth;
+				trace.texture_view_formats[i] = static_cast<uint32_t>(texture.view_info.format);
+				trace.texture_view_types[i] = static_cast<uint32_t>(texture.view_info.type);
+			}
+		}
+		FrameTraceAdd(trace);
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

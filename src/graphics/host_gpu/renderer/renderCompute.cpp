@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -38,6 +39,36 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+static void TraceComputeDispatch(FrameTraceRecord::Kind kind, uint64_t submit_id,
+                                 const ShaderComputeInputInfo& input,
+                                 const PreparedBindings& bindings, uint32_t x, uint32_t y,
+                                 uint32_t z) {
+	if (!FrameTraceActive()) {
+		return;
+	}
+	FrameTraceRecord trace {};
+	trace.kind = kind;
+	trace.submit_id = submit_id;
+	trace.pixel_hash = input.stage.program->shader_hash;
+	trace.work_count[0] = x;
+	trace.work_count[1] = y;
+	trace.work_count[2] = z;
+	trace.texture_count = static_cast<uint32_t>(bindings.images.size());
+	trace.buffer_count = static_cast<uint32_t>(bindings.buffers.size());
+	for (size_t i = 0; i < std::min(bindings.images.size(), trace.texture_addresses.size()); i++) {
+		trace.texture_addresses[i] = bindings.images[i].desc.info.data.address;
+		trace.texture_formats[i] = static_cast<uint32_t>(bindings.images[i].desc.info.guest_format);
+		const auto& texture = bindings.images[i].desc;
+		trace.texture_widths[i] = texture.info.extent.width;
+		trace.texture_heights[i] = texture.info.extent.height;
+		trace.texture_depths[i] = texture.info.extent.depth;
+		trace.texture_view_formats[i] = static_cast<uint32_t>(texture.view_info.format);
+		trace.texture_view_types[i] = static_cast<uint32_t>(texture.view_info.type);
+	}
+	FrameTraceAdd(trace);
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -350,6 +381,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
+	TraceComputeDispatch(FrameTraceRecord::Kind::DirectDispatch, submit_id, input_info, bindings,
+	                     thread_group_x, thread_group_y, thread_group_z);
 
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -470,6 +503,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	TraceComputeDispatch(FrameTraceRecord::Kind::IndirectDispatch, submit_id, input_info, bindings,
+	                     0, 0, 0);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();

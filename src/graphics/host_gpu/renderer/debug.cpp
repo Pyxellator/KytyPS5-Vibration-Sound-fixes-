@@ -13,8 +13,103 @@
 #include <atomic>
 #include <cmath>
 #include <fmt/format.h>
+#include <mutex>
+#include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+constexpr size_t FrameTraceCapacity = 4096;
+std::mutex g_frame_trace_mutex;
+std::array<FrameTraceRecord, FrameTraceCapacity> g_frame_trace_records;
+uint64_t g_frame_trace_count = 0;
+bool g_frame_trace_requested = false;
+std::atomic_bool g_frame_trace_active = false;
+
+} // namespace
+
+void RequestFrameTrace() {
+	bool requested = false;
+	{
+		std::lock_guard lock(g_frame_trace_mutex);
+		if (!g_frame_trace_active.load(std::memory_order_relaxed)) {
+			g_frame_trace_requested = true;
+			requested = true;
+		}
+	}
+	if (requested) {
+		LOGF("Frame trace requested: recording one guest frame after the next flip\n");
+	}
+}
+
+bool FrameTraceActive() {
+	return g_frame_trace_active.load(std::memory_order_acquire);
+}
+
+void FrameTraceAdd(const FrameTraceRecord& record) {
+	std::lock_guard lock(g_frame_trace_mutex);
+	if (g_frame_trace_active.load(std::memory_order_relaxed)) {
+		g_frame_trace_records[g_frame_trace_count % FrameTraceCapacity] = record;
+		g_frame_trace_count++;
+	}
+}
+
+void FrameTraceOnGuestFlip() {
+	std::vector<FrameTraceRecord> records;
+	uint64_t total = 0;
+	bool begin = false;
+	bool completed = false;
+	{
+		std::lock_guard lock(g_frame_trace_mutex);
+		if (!g_frame_trace_active.load(std::memory_order_relaxed)) {
+			if (g_frame_trace_requested) {
+				g_frame_trace_requested = false;
+				g_frame_trace_count = 0;
+				g_frame_trace_active.store(true, std::memory_order_release);
+				begin = true;
+			}
+		} else {
+			g_frame_trace_active.store(false, std::memory_order_release);
+			completed = true;
+			total = g_frame_trace_count;
+			const auto retained = std::min<uint64_t>(total, FrameTraceCapacity);
+			records.reserve(retained);
+			for (uint64_t i = total - retained; i < total; i++) {
+				records.push_back(g_frame_trace_records[i % FrameTraceCapacity]);
+			}
+		}
+	}
+	if (begin) {
+		LOGF("Frame trace begin: sync_raw_image_buffers=%u shader_optimization=%u\n",
+		     Config::SyncRawImageBuffersEnabled() ? 1u : 0u,
+		     static_cast<unsigned>(Config::GetShaderOptimizationType()));
+		return;
+	}
+	if (!completed) {
+		return;
+	}
+	LOGF("Frame trace end: operations=%" PRIu64 " retained=%zu\n", total, records.size());
+	for (const auto& record: records) {
+		LOGF("Frame trace op=%u submit=%" PRIu64 " vs=0x%016" PRIx64
+		     " ps_or_cs=0x%016" PRIx64 " work=%u,%u,%u targets=%u textures=%u buffers=%u\n",
+		     static_cast<unsigned>(record.kind), record.submit_id, record.vertex_hash,
+		     record.pixel_hash, record.work_count[0], record.work_count[1], record.work_count[2],
+		     record.target_count, record.texture_count, record.buffer_count);
+		for (size_t i = 0; i < std::min<size_t>(record.target_count, record.target_addresses.size()); i++) {
+			LOGF("  target[%zu] slot=%u addr=0x%016" PRIx64 " format=%u size=%ux%u\n",
+			     i, record.target_slots[i], record.target_addresses[i], record.target_formats[i],
+			     record.target_widths[i], record.target_heights[i]);
+		}
+		for (size_t i = 0; i < std::min<size_t>(record.texture_count, record.texture_addresses.size()); i++) {
+			LOGF("  texture[%zu] addr=0x%016" PRIx64
+			     " format=%u size=%ux%ux%u view_format=%u view_type=%u\n", i,
+			     record.texture_addresses[i], record.texture_formats[i], record.texture_widths[i],
+			     record.texture_heights[i], record.texture_depths[i],
+			     record.texture_view_formats[i], record.texture_view_types[i]);
+		}
+	}
+}
 
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
