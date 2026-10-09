@@ -133,6 +133,94 @@ static void ProbeExposureOutput(RenderContext& context,
 	}
 }
 
+static void ProbeColorGradingImages(RenderContext& context,
+                                    const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                    const PreparedBindings& bindings) {
+	if (!FrameTraceActive()) {
+		return;
+	}
+	const bool has_color_lut = std::any_of(bindings.images.begin(), bindings.images.end(),
+	                                      [](const auto& binding) {
+		const auto& info = binding.desc.info;
+		return info.guest_format == Prospero::BufferFormat::k16_16_16_16Float &&
+		       info.extent == vk::Extent3D {32, 32, 32};
+	});
+	if (!has_color_lut) {
+		return;
+	}
+	for (bool written: {false, true}) {
+		for (size_t i = 0; i < program.info.images.size(); i++) {
+			const auto& resource = program.info.images[i];
+			const auto& binding  = bindings.images[i];
+			const auto& info     = binding.desc.info;
+			if (resource.written != written ||
+			    info.guest_format != Prospero::BufferFormat::k11_11_10Float ||
+			    info.extent.width < 1280 || info.extent.height < 720 ||
+			    info.extent.depth != 1 || info.data.Empty() || !binding.image_id) {
+				continue;
+			}
+			auto& image = context.GetTextureCache().GetImage(binding.image_id);
+			if (image.info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
+			    image.info.extent != info.extent || image.info.data.Empty()) {
+				continue;
+			}
+			if (!FrameTraceClaimColorProbe()) {
+				return;
+			}
+			constexpr size_t sample_count = 12;
+			auto& download = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+			auto [mapped, offset] = download.Map(sample_count * sizeof(uint32_t), 4, false);
+			if (mapped == nullptr) {
+				LOGF("Frame trace color probe skipped: download buffer unavailable\n");
+				return;
+			}
+			download.Commit();
+			std::array<vk::BufferImageCopy, sample_count> copies {};
+			const uint32_t xs[] = {info.extent.width / 4, info.extent.width / 2,
+			                       info.extent.width * 3 / 4, info.extent.width * 9 / 10};
+			const uint32_t ys[] = {info.extent.height / 4, info.extent.height / 2,
+			                       info.extent.height * 3 / 4};
+			for (size_t sample = 0; sample < sample_count; sample++) {
+				auto& copy = copies[sample];
+				copy.bufferOffset = offset + sample * sizeof(uint32_t);
+				copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+				copy.imageSubresource.layerCount = 1;
+				copy.imageOffset = vk::Offset3D {static_cast<int32_t>(xs[sample % 4]),
+				                                  static_cast<int32_t>(ys[sample / 4]), 0};
+				copy.imageExtent = vk::Extent3D {1, 1, 1};
+			}
+			image.Download(copies, download.Handle(), offset, sample_count * sizeof(uint32_t));
+			vk::BufferMemoryBarrier barrier {};
+			barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.buffer = download.Handle();
+			barrier.offset = offset;
+			barrier.size = sample_count * sizeof(uint32_t);
+			context.GetCommandScheduler().Current().Handle().pipelineBarrier(
+			    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
+			    0, nullptr, 1, &barrier, 0, nullptr);
+			const auto address = info.data.address;
+			context.GetCommandScheduler().DeferPriorityOperation(
+			    [&download, mapped, offset, address, written] {
+				    download.Invalidate(offset, sample_count * sizeof(uint32_t));
+				    uint32_t samples[sample_count] {};
+				    std::memcpy(samples, mapped, sizeof(samples));
+				    LOGF("Frame trace color %s addr=0x%016" PRIx64
+				         " samples=%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32
+				         ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32
+				         ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 "\n",
+				         written ? "after" : "before", address,
+				         samples[0], samples[1], samples[2], samples[3],
+				         samples[4], samples[5], samples[6], samples[7],
+				         samples[8], samples[9], samples[10], samples[11]);
+			    });
+			break;
+		}
+	}
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -532,6 +620,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ProbeExposureOutput(m_context, program, bindings);
+	ProbeColorGradingImages(m_context, program, bindings);
 	ResetBindings();
 }
 
@@ -594,6 +683,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ProbeExposureOutput(m_context, program, bindings);
+	ProbeColorGradingImages(m_context, program, bindings);
 	ResetBindings();
 }
 
