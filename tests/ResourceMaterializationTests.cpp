@@ -27,12 +27,12 @@ AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   auto block = std::make_unique<Block>();
   auto *result = block.get();
   program.blocks.push_back(result);
-  program.block_info.push_back({.id = 0});
+  result->id = static_cast<uint32_t>(program.blocks.size() - 1u);
   program.block_storage.push_back(std::move(block));
   return *result;
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address) {
+Libs::Graphics::ShaderRecompiler::IR::Program SrtProgram(uint64_t address) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -62,7 +62,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address) {
   source.dwords[1] = Value(0u);
   source.dword_count = 2;
   program.descriptor_sources.push_back(source);
-  return ExtractResourcePlan(program);
+  return program;
 }
 
 Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
@@ -152,7 +152,7 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
-  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&dword));
+  auto plan = ExtractResourcePlan(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
   uint32_t specialization_reads = 0;
   const SrtRuntime runtime{.userdata = &specialization_reads,
                            .read_specialization_memory =
@@ -170,7 +170,7 @@ void TestMappedSrtUsesDirectReaderByDefault() {
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  auto plan = SrtPlan(0x10000);
+  auto plan = SrtProgram(0x10000);
   const auto root = plan.descriptor_sources.front().dwords[0];
   Check(ValidateRuntimeValue(plan, root, RuntimeValueType::Integer),
         "integer SRT read was rejected");
@@ -215,6 +215,98 @@ void TestIntegerRuntimeValueFollowsSrtReads() {
   plan.srt_reads[0].value = Value(&first);
   Check(!ValidateRuntimeValue(plan, root, RuntimeValueType::Integer),
         "cyclic SRT read-first-lane dependency was accepted");
+}
+
+void TestSrtAliasesRetainReadPolicy() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = SrtProgram(0x1000u);
+  auto &block = *program.blocks[0];
+  const auto append_read = [&](uint32_t address) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)});
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    // Different reads deliberately share MemoryInfo but have different guest PCs.
+    read.SetFlags(MemoryFlags{.index = 0, .pc = address});
+    const auto slot = static_cast<uint32_t>(program.srt_reads.size());
+    program.srt_reads.push_back({Value(&read), slot});
+    auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+    return Value(&block.AppendNewInst(ValueOpcode::ReadConst,
+                                      {Value(&srt), Value(slot)}));
+  };
+  const auto ordinary = append_read(0x2000u);
+  const auto pointer = append_read(0x3000u);
+  program.srt_reads[0].value.Instruction()->Arg(0).Instruction()->SetArg(0, pointer);
+  auto &mask = block.AppendNewInst(ValueOpcode::INotEqual32, {ordinary, Value(0u)});
+  auto &first = block.AppendNewInst(ValueOpcode::ReadFirstLane,
+                                    {Value(9u), Value(&mask)});
+  program.descriptor_sources.push_back({.dwords = {Value(&first), Value(0u)},
+                                       .dword_count = 2});
+  DescriptorSource indirect;
+  indirect.indirect_descriptor.emplace().sources = {0, 1};
+  program.descriptor_sources.push_back(indirect);
+  auto plan = ExtractResourcePlan(program);
+  for (const auto &inst : plan.value_storage) {
+    Check(inst.GetOpcode() != ValueOpcode::ReadConst &&
+              inst.GetOpcode() != ValueOpcode::GetSrtResource,
+          "retained plan still contains flattened-read aliases");
+  }
+  Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value &&
+            plan.srt_reads[0].value.Instruction()->Flags<SrtReadFlags>().clean == 1u &&
+            plan.srt_reads[1].value.Instruction()->Flags<SrtReadFlags>().clean == 0u &&
+            plan.srt_reads[2].value.Instruction()->Flags<SrtReadFlags>().clean == 1u,
+        "alias normalization lost read identity or retained discarded EXEC provenance");
+  struct Reads { uint32_t strict = 0; uint32_t ordinary = 0; bool dirty = false; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        if (address == 0x2000u) words[0] = 0x2222u;
+        else if (address == 0x3000u) words[0] = 0x8000u;
+        else if (address == 0x8000u) words[0] = 0xeeeeu;
+        else return false;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (reads.dirty) return false;
+        if (address == 0x3000u) words[0] = 0x1000u;
+        else if (address == 0x1000u) words[0] = 0x1111u;
+        else return false;
+        return true;
+      }};
+  std::vector<uint32_t> flat;
+  DescriptorValue descriptor;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, &clean);
+    Check(walker.RefreshFlatBuffer(flat) &&
+              flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+              walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == 0x1111u &&
+              reads.strict == 2 && reads.ordinary == 1,
+          "normalized aliases changed nested strict reads or repeated a shared read");
+  }
+  Check(!SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+        "strict flat read accepted a missing clean evaluator");
+  auto no_reader = runtime;
+  no_reader.read_specialization_memory = nullptr;
+  {
+    SrtWalker clean(plan, CleanRuntime(no_reader));
+    Check(!SrtWalker(plan, no_reader, &clean).RefreshFlatBuffer(flat),
+          "strict flat read accepted a missing strict reader");
+  }
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, descriptor) &&
+            descriptor.dwords[0] == 0xeeeeu && reads.strict == 2 && reads.ordinary == 3,
+        "direct descriptor evaluation without a clean evaluator changed read domains");
+  reads.dirty = true;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    Check(!SrtWalker(plan, runtime, &clean).RefreshFlatBuffer(flat) &&
+              reads.strict == 3 && reads.ordinary == 3,
+          "dirty strict pointer fell back to an ordinary read");
+  }
 }
 
 void TestUniformVectorDescriptorRead() {
@@ -285,16 +377,24 @@ void TestUniformVectorDescriptorRead() {
   }
   count.SetArg(4, Value(false));
   auto &inactive = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&count), Value(false)});
+  program.descriptor_sources.push_back({.dwords = {Value(&inactive)}, .dword_count = 1});
   reads.strict = 0;
   uint32_t result = 99;
-  Check(SrtWalker(program, runtime).Evaluate(Value(&inactive), result) &&
-            result == 0 && reads.strict == 0 && reads.ordinary == 0,
-        "literal false EXEC read vector memory");
+  {
+    const auto plan = ExtractResourcePlan(program);
+    Check(SrtWalker(plan, runtime).Evaluate(plan.descriptor_sources.back().dwords[0], result) &&
+              result == 0 && reads.strict == 0 && reads.ordinary == 0,
+          "literal false EXEC read vector memory");
+  }
   count.SetArg(4, Value(true));
   handle.SetArg(3, Value(0x204u));
-  Check(SrtWalker(program, runtime).Evaluate(Value(&count), result) &&
-            result == 0 && reads.strict == 0 && reads.ordinary == 0,
-        "invalid vector buffer format read memory");
+  program.descriptor_sources.back().dwords[0] = Value(&count);
+  {
+    const auto plan = ExtractResourcePlan(program);
+    Check(SrtWalker(plan, runtime).Evaluate(plan.descriptor_sources.back().dwords[0], result) &&
+              result == 0 && reads.strict == 0 && reads.ordinary == 0,
+          "invalid vector buffer format read memory");
+  }
   handle.SetArg(3, Value(0x16204u));
   count.SetArg(1, Value(&lane));
   Check(!ValidateRuntimeValue(program, Value(&count)),
@@ -335,7 +435,7 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
-void TestWrittenDescriptorUsesStrictReaderOnce() {
+void TestWrittenDescriptorPredicateReads(bool memory_condition, bool loop) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -356,23 +456,37 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0, .written = true});
-  // A host-evaluable branch captures resource reads and needs the writable
-  // descriptor's clean provenance for the renderer's disjointness proof.
+  // Only memory-derived host decisions need clean, disjoint descriptor reads.
   auto &condition = block.AppendNewInst(ValueOpcode::IEqual32,
-                                        {Value(&offset), Value(4u)});
+      {memory_condition ? Value(&read) : Value(&offset),
+       Value(memory_condition ? 0x8000u : 4u)});
   auto &store_block = AddValueBlock(program);
   AddValueBlock(program);
-  program.block_info[0].condition = Value(&condition);
-  program.block_info[0].terminator.kind =
+  program.blocks[0]->condition = Value(&condition);
+  program.blocks[0]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-  program.block_info[0].terminator.true_block = 1;
-  program.block_info[0].terminator.false_block = 2;
-  program.block_info[1].id = 1;
-  program.block_info[1].terminator.kind =
+  program.blocks[0]->terminator.true_block = program.blocks[1];
+  program.blocks[0]->terminator.false_block = program.blocks[2];
+
+  program.blocks[1]->id = 1;
+  program.blocks[1]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
-  program.block_info[2].id = 2;
-  program.block_info[2].terminator.kind =
+  program.blocks[2]->id = 2;
+  program.blocks[2]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  if (loop) {
+    // The predicate reaches the store through a continue block, then loops back.
+    auto &continued = AddValueBlock(program);
+    program.blocks[0]->terminator.true_block = &continued;
+    continued.terminator.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+    continued.terminator.true_block = &store_block;
+    continued.AddBranch(&store_block);
+    store_block.terminator.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+    store_block.terminator.true_block = &block;
+    store_block.AddBranch(&block);
+  }
+  block.AddBranch(program.blocks[0]->terminator.true_block);
+  block.AddBranch(program.blocks[2]);
   program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
   auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,
       {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
@@ -380,8 +494,8 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
       {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
       .SetFlags(MemoryFlags{.index = 1});
   auto plan = ExtractResourcePlan(program);
-  Check(plan.capture_specialization_reads,
-        "conditional writable descriptor lost its alias proof");
+  Check(plan.capture_specialization_reads == memory_condition && !plan.control_flow.empty(),
+        "conditional writable descriptor used the wrong memory dependency policy");
   struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
   const std::array<uint32_t, 1> user_data{4u};
   const SrtRuntime runtime{
@@ -401,16 +515,21 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
       }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.ordinary == 0 && reads.strict == 1,
-        "GPU-dirty dynamic writable descriptor bypassed strict provenance");
-  reads.clean = true;
-  reads.strict = 0;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u &&
-            snapshot.specialization_reads ==
-                std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}},
-        "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
+  for (const bool clean : {false, true}) {
+    reads = {.clean = clean};
+    // A failed predicate explores both edges and the writable descriptor retries its clean read.
+    const bool expected = !memory_condition || clean;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) == expected &&
+              reads.ordinary == (memory_condition ? 0u : 1u) &&
+              reads.strict == (memory_condition ? (clean ? 1u : 2u) : 0u),
+          "writable descriptor changed reader policy or bypassed a dirty memory predicate");
+    if (!expected) continue;
+    Check(snapshot.buffers[0].dwords[0] == 0x8000u &&
+              snapshot.specialization_reads == (memory_condition
+                  ? std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}}
+                  : std::vector<std::pair<uint64_t, uint64_t>>{}),
+          "writable descriptor lost its address or captured an immutable predicate");
+  }
 }
 
 void TestFailedMaterializationRejectsStage() {
@@ -567,10 +686,13 @@ void DbgExit(int) { std::abort(); }
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
+  TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
-  TestWrittenDescriptorUsesStrictReaderOnce();
+  for (const bool memory_condition : {false, true})
+    for (const bool loop : {false, true})
+      TestWrittenDescriptorPredicateReads(memory_condition, loop);
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
