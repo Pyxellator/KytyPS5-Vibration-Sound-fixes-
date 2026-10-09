@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <optional>
 
@@ -15,7 +16,8 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
 
-void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
+void ReportVulkanFatal(const GraphicContext& graphics, const char* what, vk::Result result,
+                       uint64_t tick, uint32_t debug_op,
                        uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
                        uint32_t arg3, uint64_t arg4) {
 	LOGF("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
@@ -27,6 +29,47 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+	if (result != vk::Result::eErrorDeviceLost || !graphics.device_fault_enabled ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT == nullptr) {
+		return;
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	auto fault_result = graphics.device.getFaultInfoEXT(&counts, nullptr);
+	if (fault_result != vk::Result::eSuccess) {
+		LOGF("Vulkan device fault query failed: %s\n", vk::to_string(fault_result).c_str());
+		return;
+	}
+	constexpr uint32_t max_fault_infos = 16;
+	std::array<vk::DeviceFaultAddressInfoEXT, max_fault_infos> addresses {};
+	std::array<vk::DeviceFaultVendorInfoEXT, max_fault_infos> vendors {};
+	const auto reported_addresses = counts.addressInfoCount;
+	const auto reported_vendors = counts.vendorInfoCount;
+	const auto binary_size = counts.vendorBinarySize;
+	counts.addressInfoCount = std::min(counts.addressInfoCount, max_fault_infos);
+	counts.vendorInfoCount = std::min(counts.vendorInfoCount, max_fault_infos);
+	counts.vendorBinarySize = 0;
+	vk::DeviceFaultInfoEXT fault {};
+	fault.pAddressInfos = addresses.data();
+	fault.pVendorInfos = vendors.data();
+	fault_result = graphics.device.getFaultInfoEXT(&counts, &fault);
+	LOGF("Vulkan device fault: result=%s description=%.256s addresses=%u vendors=%u "
+	     "vendor_binary_bytes=%" PRIu64 "\n",
+	     vk::to_string(fault_result).c_str(), fault.description.data(), reported_addresses,
+	     reported_vendors, static_cast<uint64_t>(binary_size));
+	if (fault_result != vk::Result::eSuccess && fault_result != vk::Result::eIncomplete) {
+		return;
+	}
+	for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+		LOGF("  fault address[%u]: type=%s address=0x%016" PRIx64 " precision=%" PRIu64 "\n",
+		     i, vk::to_string(addresses[i].addressType).c_str(),
+		     static_cast<uint64_t>(addresses[i].reportedAddress),
+		     static_cast<uint64_t>(addresses[i].addressPrecision));
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
+		LOGF("  fault vendor[%u]: %.256s code=0x%016" PRIx64 " data=0x%016" PRIx64 "\n",
+		     i, vendors[i].description.data(), vendors[i].vendorFaultCode,
+		     vendors[i].vendorFaultData);
+	}
 }
 
 } // namespace
@@ -378,7 +421,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		if (FrameTraceActive()) {
 			FrameTraceOnGuestFlip();
 		}
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
+		ReportVulkanFatal(graphics, "vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
