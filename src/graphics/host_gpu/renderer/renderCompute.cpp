@@ -69,6 +69,70 @@ static void TraceComputeDispatch(FrameTraceRecord::Kind kind, uint64_t submit_id
 	FrameTraceAdd(trace);
 }
 
+static void ProbeExposureOutput(RenderContext& context,
+                                const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                const PreparedBindings& bindings) {
+	if (!FrameTraceActive()) {
+		return;
+	}
+	for (size_t i = 0; i < program.info.images.size(); i++) {
+		const auto& resource = program.info.images[i];
+		const auto& binding = bindings.images[i];
+		const auto& info = binding.desc.info;
+		if (!resource.written ||
+		    resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Storage ||
+		    info.guest_format != Prospero::BufferFormat::k32_32Float ||
+		    info.extent != vk::Extent3D {1, 1, 1} || info.data.Empty() ||
+		    !binding.image_id) {
+			continue;
+		}
+		auto& image = context.GetTextureCache().GetImage(binding.image_id);
+		if (image.info.pixel_format != vk::Format::eR32G32Sfloat ||
+		    image.info.extent != vk::Extent3D {1, 1, 1} || image.info.data.Empty()) {
+			continue;
+		}
+		if (!FrameTraceClaimColorProbe()) {
+			return;
+		}
+		auto& scheduler = context.GetCommandScheduler();
+		auto& download = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+		auto [mapped, offset] = download.Map(8, 8, false);
+		if (mapped == nullptr) {
+			LOGF("Frame trace exposure probe skipped: download buffer unavailable\n");
+			return;
+		}
+		download.Commit();
+		vk::BufferImageCopy copy {};
+		copy.bufferOffset = offset;
+		copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+		copy.imageSubresource.layerCount = 1;
+		copy.imageExtent = vk::Extent3D {1, 1, 1};
+		image.Download(std::span {&copy, 1u}, download.Handle(), offset, 8);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer = download.Handle();
+		barrier.offset = offset;
+		barrier.size = 8;
+		scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		    vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+		const auto address = info.data.address;
+		scheduler.DeferPriorityOperation([&download, mapped, offset, address] {
+			download.Invalidate(offset, 8);
+			uint32_t bits[2] {};
+			float values[2] {};
+			std::memcpy(bits, mapped, sizeof(bits));
+			std::memcpy(values, bits, sizeof(values));
+			LOGF("Frame trace exposure addr=0x%016" PRIx64
+			     " raw=%08" PRIx32 ",%08" PRIx32 " value=%g,%g\n",
+			     address, bits[0], bits[1], values[0], values[1]);
+		});
+		return;
+	}
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -467,6 +531,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ProbeExposureOutput(m_context, program, bindings);
 	ResetBindings();
 }
 
@@ -528,6 +593,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ProbeExposureOutput(m_context, program, bindings);
 	ResetBindings();
 }
 
