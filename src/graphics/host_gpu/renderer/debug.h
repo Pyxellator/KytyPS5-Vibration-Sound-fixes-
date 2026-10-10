@@ -55,6 +55,7 @@ void FrameTraceOnGuestFlip();
 bool FrameTraceActive();
 void FrameTraceAdd(const FrameTraceRecord& record);
 bool FrameTraceClaimColorProbe();
+bool FrameTraceClaimGbufferProbe();
 
 uint32_t                 render_target_mask_slot(uint32_t mask, uint32_t slot);
 uint32_t                 render_target_first_bound_slot(const CommandBuffer& buffer);

@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <fstream>
 #include <optional>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -47,10 +49,17 @@ void ReportVulkanFatal(const GraphicContext& graphics, const char* what, vk::Res
 	const auto binary_size = counts.vendorBinarySize;
 	counts.addressInfoCount = std::min(counts.addressInfoCount, max_fault_infos);
 	counts.vendorInfoCount = std::min(counts.vendorInfoCount, max_fault_infos);
-	counts.vendorBinarySize = 0;
+	constexpr size_t max_vendor_binary_size = 1024 * 1024;
+	std::vector<uint8_t> vendor_binary;
+	if (binary_size <= max_vendor_binary_size) {
+		vendor_binary.resize(static_cast<size_t>(binary_size));
+	} else {
+		counts.vendorBinarySize = 0;
+	}
 	vk::DeviceFaultInfoEXT fault {};
 	fault.pAddressInfos = addresses.data();
 	fault.pVendorInfos = vendors.data();
+	fault.pVendorBinaryData = vendor_binary.empty() ? nullptr : vendor_binary.data();
 	fault_result = graphics.device.getFaultInfoEXT(&counts, &fault);
 	LOGF("Vulkan device fault: result=%s description=%.256s addresses=%u vendors=%u "
 	     "vendor_binary_bytes=%" PRIu64 "\n",
@@ -69,6 +78,18 @@ void ReportVulkanFatal(const GraphicContext& graphics, const char* what, vk::Res
 		LOGF("  fault vendor[%u]: %.256s code=0x%016" PRIx64 " data=0x%016" PRIx64 "\n",
 		     i, vendors[i].description.data(), vendors[i].vendorFaultCode,
 		     vendors[i].vendorFaultData);
+	}
+	if (!vendor_binary.empty() && counts.vendorBinarySize <= vendor_binary.size()) {
+		std::array<char, 64> filename {};
+		std::snprintf(filename.data(), filename.size(), "_VulkanDeviceFault_%" PRIu64 ".bin",
+		              tick);
+		std::ofstream file(filename.data(), std::ios::binary | std::ios::trunc);
+		file.write(reinterpret_cast<const char*>(vendor_binary.data()),
+		           static_cast<std::streamsize>(counts.vendorBinarySize));
+		file.close();
+		LOGF("Vulkan device fault binary: %s (%" PRIu64 " bytes, %s)\n",
+		     filename.data(), static_cast<uint64_t>(counts.vendorBinarySize),
+		     file.fail() ? "write failed" : "saved");
 	}
 }
 

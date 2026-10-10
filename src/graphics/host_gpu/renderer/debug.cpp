@@ -25,6 +25,7 @@ std::mutex g_frame_trace_mutex;
 std::array<FrameTraceRecord, FrameTraceCapacity> g_frame_trace_records;
 uint64_t g_frame_trace_count = 0;
 uint32_t g_frame_trace_color_probes = 0;
+bool g_frame_trace_gbuffer_probed = false;
 bool g_frame_trace_requested = false;
 std::atomic_bool g_frame_trace_active = false;
 
@@ -66,6 +67,17 @@ bool FrameTraceClaimColorProbe() {
 	return true;
 }
 
+bool FrameTraceClaimGbufferProbe() {
+	std::lock_guard lock(g_frame_trace_mutex);
+	if (!g_frame_trace_active.load(std::memory_order_relaxed) ||
+	    g_frame_trace_gbuffer_probed || g_frame_trace_color_probes > 5) {
+		return false;
+	}
+	g_frame_trace_gbuffer_probed = true;
+	g_frame_trace_color_probes += 3;
+	return true;
+}
+
 void FrameTraceOnGuestFlip() {
 	std::vector<FrameTraceRecord> records;
 	uint64_t total = 0;
@@ -78,6 +90,7 @@ void FrameTraceOnGuestFlip() {
 				g_frame_trace_requested = false;
 				g_frame_trace_count = 0;
 				g_frame_trace_color_probes = 0;
+				g_frame_trace_gbuffer_probed = false;
 				g_frame_trace_active.store(true, std::memory_order_release);
 				begin = true;
 			}
